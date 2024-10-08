@@ -18,7 +18,7 @@
 import math
 from typing import Dict, Optional, Tuple, Union
 #Used for MinMaxObserver() (DZ)
-import torch.quantization as quant
+#import torch.quantization as quant
 
 import torch
 import torch.utils.checkpoint
