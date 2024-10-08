@@ -17,8 +17,6 @@
 
 import math
 from typing import Dict, Optional, Tuple, Union
-#Used for MinMaxObserver() (DZ)
-#import torch.quantization as quant
 
 import torch
 import torch.utils.checkpoint
@@ -52,9 +50,6 @@ class RecurrentGemmaRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        #Add MinMax Observer (DZ)
-        self.observer = quant.MinMaxObserver()
-
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -64,10 +59,7 @@ class RecurrentGemmaRMSNorm(nn.Module):
         # Llama does x.to(float16) * w whilst RecurrentGemma is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
-        self.observer(output)
-
-        #Return observer min and max values (DZ)
-        return output.type_as(x), self.observer.min_val, self.observer.max_val
+        return output.type_as(x)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
