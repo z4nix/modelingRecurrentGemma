@@ -43,6 +43,49 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "RecurrentGemmaConfig"
 _MAX_SQRT_GRADIENT = 1000.0
 
+class Recorder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.n_samples = 0
+        self.min_per_channel = None
+        self.max_per_channel = None
+        self.mean_per_channel = None
+        self.m2_per_channel = None  # For Welford's algorithm to calculate variance
+
+    def forward(self, x):
+        # Assume x has shape (batch_size, channels, ...)
+        # We'll reduce across all dimensions except the channel dimension
+        dims = tuple(range(2, x.dim()))  # Reduce over dimensions beyond channels
+
+        # Calculate per-channel statistics for the current batch
+        batch_min = x.amin(dim=dims)
+        batch_max = x.amax(dim=dims)
+        batch_mean = x.mean(dim=dims)
+        batch_var = x.var(dim=dims, unbiased=False)
+
+        if self.n_samples == 0:
+            # Initialize per-channel stats
+            self.min_per_channel = batch_min
+            self.max_per_channel = batch_max
+            self.mean_per_channel = batch_mean
+            self.m2_per_channel = batch_var  # m2 is the sum of squared deviations
+        else:
+            # Update min and max per channel
+            self.min_per_channel = torch.min(self.min_per_channel, batch_min)
+            self.max_per_channel = torch.max(self.max_per_channel, batch_max)
+
+            # Update mean and variance using Welford's algorithm
+            delta = batch_mean - self.mean_per_channel
+            new_n_samples = self.n_samples + 1
+            self.mean_per_channel += delta / new_n_samples
+            self.m2_per_channel += batch_var + delta ** 2 * self.n_samples / new_n_samples
+
+        self.n_samples += 1
+
+        # Standard deviation is the square root of variance
+        self.std_per_channel = torch.sqrt(self.m2_per_channel / self.n_samples)
+
+        return x
 
 # Copied from transformers.models.gemma.modeling_gemma.GemmaRMSNorm with Gemma->RecurrentGemma
 class RecurrentGemmaRMSNorm(nn.Module):
@@ -50,6 +93,7 @@ class RecurrentGemmaRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
+        self.recorder = Recorder()
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -59,6 +103,9 @@ class RecurrentGemmaRMSNorm(nn.Module):
         # Llama does x.to(float16) * w whilst RecurrentGemma is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
+
+        #DZ Recorder
+        self.recorder(x)
         return output.type_as(x)
 
     def extra_repr(self):
