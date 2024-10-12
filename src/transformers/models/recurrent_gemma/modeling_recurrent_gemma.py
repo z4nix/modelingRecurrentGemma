@@ -43,13 +43,68 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "RecurrentGemmaConfig"
 _MAX_SQRT_GRADIENT = 1000.0
 
+class Recorder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.n_samples = 0
+        self.min_per_channel = None
+        self.max_per_channel = None
+        self.mean_per_channel = None
+        self.m2_per_channel = None  # For Welford's algorithm to calculate variance
+        self.outliers_per_channel = None  # Track outliers
 
+    def forward(self, x):
+        # Assume x has shape (batch_size, channels, ...)
+        # We'll reduce across all dimensions except the channel dimension
+        dims = tuple(range(2, x.dim()))  # Reduce over dimensions beyond channels
+
+        # Calculate per-channel statistics for the current batch
+        batch_min = x.amin(dim=dims)
+        batch_max = x.amax(dim=dims)
+        batch_mean = x.mean(dim=dims)
+        batch_var = x.var(dim=dims, unbiased=False)
+
+        if self.n_samples == 0:
+            # Initialize per-channel stats
+            self.min_per_channel = batch_min
+            self.max_per_channel = batch_max
+            self.mean_per_channel = batch_mean
+            self.m2_per_channel = batch_var  # m2 is the sum of squared deviations
+            # Initialize outlier count to zero
+            self.outliers_per_channel = torch.zeros_like(batch_mean)
+        else:
+            # Update min and max per channel
+            self.min_per_channel = torch.min(self.min_per_channel, batch_min)
+            self.max_per_channel = torch.max(self.max_per_channel, batch_max)
+
+            # Update mean and variance using Welford's algorithm
+            delta = batch_mean - self.mean_per_channel
+            new_n_samples = self.n_samples + 1
+            self.mean_per_channel += delta / new_n_samples
+            self.m2_per_channel += batch_var + delta ** 2 * self.n_samples / new_n_samples
+
+        self.n_samples += 1
+
+        # Standard deviation is the square root of variance
+        self.std_per_channel = torch.sqrt(self.m2_per_channel / self.n_samples)
+
+        # Correctly broadcast mean and std across all dimensions except the channel dimension
+        mean_broadcast = self.mean_per_channel.view(1, -1, *([1] * (x.dim() - 2)))
+        std_broadcast = self.std_per_channel.view(1, -1, *([1] * (x.dim() - 2)))
+
+        # Calculate outliers based on 6*std threshold
+        outliers = torch.abs(x - mean_broadcast) > 6 * std_broadcast
+        # Count the number of outliers per channel
+        self.outliers_per_channel += outliers.sum(dim=dims)
+
+        return x
 # Copied from transformers.models.gemma.modeling_gemma.GemmaRMSNorm with Gemma->RecurrentGemma
 class RecurrentGemmaRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
+        self.recorder = Recorder()
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -59,6 +114,9 @@ class RecurrentGemmaRMSNorm(nn.Module):
         # Llama does x.to(float16) * w whilst RecurrentGemma is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
+
+        #DZ Recorder
+        self.recorder(x)
         return output.type_as(x)
 
     def extra_repr(self):
@@ -893,6 +951,43 @@ class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
             logits=logits,
             hidden_states=outputs.hidden_states,
         )
+
+    # Ignore copy
+    def prepare_inputs_for_generation(
+        self, input_ids, attention_mask=None, inputs_embeds=None, cache_position=None, use_cache=None, **kwargs
+    ):
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+
+        attention_mask = attention_mask[:, -self.config.attention_window_size :]
+
+        past_length = cache_position[0]
+        if past_length > 0:
+            position_ids = position_ids[:, past_length:]
+
+        if inputs_embeds is not None:  # Exception 1
+            input_ids = input_ids[:, -cache_position.shape[0] :]
+        elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
+            input_ids = input_ids[:, cache_position]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and cache_position[0] == 0:
+            model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
+        else:
+            # The clone here is for the same reason as for `position_ids`.
+            model_inputs = {"input_ids": input_ids.clone(memory_format=torch.contiguous_format), "inputs_embeds": None}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "use_cache": use_cache,
+            }
+        )
+        return model_inputs
 
     # Ignore copy
     def _reorder_cache(self, past_key_values, beam_idx):
