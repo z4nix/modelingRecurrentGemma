@@ -43,6 +43,9 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "RecurrentGemmaConfig"
 _MAX_SQRT_GRADIENT = 1000.0
 
+import torch
+import torch.nn as nn
+
 class Recorder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -50,30 +53,33 @@ class Recorder(nn.Module):
         self.min_per_channel = None
         self.max_per_channel = None
         self.mean_per_channel = None
-        self.m2_per_channel = None  # For variance computation
+        self.m2_per_channel = None  # For variance calculation
+        self.std_per_channel = None
+        self.outliers_per_channel = None  # Track outliers
 
     def forward(self, x):
         if self.n_samples == 0:
-            # Initialize stats on the first pass
-            self.min_per_channel = x
-            self.max_per_channel = x
-            self.mean_per_channel = x
+            # Initialize statistics on first batch
+            self.min_per_channel = x.clone()
+            self.max_per_channel = x.clone()
+            self.mean_per_channel = x.clone()
             self.m2_per_channel = torch.zeros_like(x)  # Initialize for variance tracking
+            self.outliers_per_channel = torch.zeros_like(x)  # Initialize outlier count
         else:
-            # Update min and max
+            # Update min and max per channel
             self.min_per_channel = torch.min(x, self.min_per_channel)
             self.max_per_channel = torch.max(x, self.max_per_channel)
-            
-            # Update mean using the running average
+
+            # Update mean using Welford's algorithm
             delta = x - self.mean_per_channel
             self.mean_per_channel += delta / (self.n_samples + 1)
 
-            # Update the second moment for variance (Welford's algorithm)
+            # Update M2 (sum of squared differences)
             delta2 = x - self.mean_per_channel
             self.m2_per_channel += delta * delta2
 
         self.n_samples += 1
-        
+
         # Calculate standard deviation from variance
         if self.n_samples > 1:
             variance = self.m2_per_channel / self.n_samples
@@ -81,7 +87,13 @@ class Recorder(nn.Module):
         else:
             self.std_per_channel = torch.zeros_like(x)
 
+        # Calculate outliers (using 6 standard deviations as the threshold)
+        if self.std_per_channel is not None:
+            outliers = torch.abs(x - self.mean_per_channel) > 6 * self.std_per_channel
+            self.outliers_per_channel += outliers.sum(dim=0)
+
         return x
+
 
 
 # Copied from transformers.models.gemma.modeling_gemma.GemmaRMSNorm with Gemma->RecurrentGemma
