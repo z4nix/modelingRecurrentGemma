@@ -51,10 +51,10 @@ class Recorder(nn.Module):
         self.max_per_channel = None
         self.mean_per_channel = None
         self.m2_per_channel = None  # For Welford's algorithm to calculate variance
+        self.outliers_per_channel = None  # Track outliers
 
     def forward(self, x):
         # Assume x has shape (batch_size, channels, ...)
-        # We'll reduce across all dimensions except the channel dimension
         dims = tuple(range(2, x.dim()))  # Reduce over dimensions beyond channels
 
         # Calculate per-channel statistics for the current batch
@@ -63,12 +63,15 @@ class Recorder(nn.Module):
         batch_mean = x.mean(dim=dims)
         batch_var = x.var(dim=dims, unbiased=False)
 
-        if self.n_samples == 0:
-            # Initialize per-channel stats
+        if self.n_samples == 0 or (self.min_per_channel is not None and batch_min.size(0) != self.min_per_channel.size(0)):
+            # Initialize or reinitialize per-channel stats if a size mismatch is detected
             self.min_per_channel = batch_min
             self.max_per_channel = batch_max
             self.mean_per_channel = batch_mean
             self.m2_per_channel = batch_var  # m2 is the sum of squared deviations
+            self.outliers_per_channel = torch.zeros_like(batch_mean)  # Initialize outlier count to zero
+            self.n_samples = 0  # Reset sample count
+
         else:
             # Update min and max per channel
             self.min_per_channel = torch.min(self.min_per_channel, batch_min)
@@ -85,7 +88,17 @@ class Recorder(nn.Module):
         # Standard deviation is the square root of variance
         self.std_per_channel = torch.sqrt(self.m2_per_channel / self.n_samples)
 
+        # Broadcast mean and std across all dimensions except the channel dimension
+        mean_broadcast = self.mean_per_channel.view(1, -1, *([1] * (x.dim() - 2)))
+        std_broadcast = self.std_per_channel.view(1, -1, *([1] * (x.dim() - 2)))
+
+        # Calculate outliers based on 6*std threshold
+        outliers = torch.abs(x - mean_broadcast) > 6 * std_broadcast
+        # Count the number of outliers per channel
+        self.outliers_per_channel += outliers.sum(dim=dims)
+
         return x
+
 
 # Copied from transformers.models.gemma.modeling_gemma.GemmaRMSNorm with Gemma->RecurrentGemma
 class RecurrentGemmaRMSNorm(nn.Module):
