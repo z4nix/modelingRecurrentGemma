@@ -89,7 +89,7 @@ class Recorder(nn.Module):
 
         # Calculate outliers (using 6 standard deviations as the threshold)
         if self.std_per_channel is not None:
-            outliers = torch.abs(x - self.mean_per_channel) > 6 * self.std_per_channel
+            outliers = torch.abs(x - self.mean_per_channel) > 3 * self.std_per_channel
             self.outliers_per_channel += outliers.sum(dim=0)
 
         return x
