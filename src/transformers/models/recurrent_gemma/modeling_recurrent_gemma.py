@@ -80,17 +80,16 @@ class Recorder(nn.Module):
 
         self.n_samples += 1
 
-        # Calculate standard deviation from variance
+        # Calculate standard deviation from variance (sample variance)
         if self.n_samples > 1:
-            variance = self.m2_per_channel / self.n_samples
+            variance = self.m2_per_channel / (self.n_samples - 1)  # Use sample variance
             self.std_per_channel = torch.sqrt(variance)
         else:
             self.std_per_channel = torch.zeros_like(x)
 
-        # Calculate outliers (using 6 standard deviations as the threshold)
-        if self.std_per_channel is not None:
-            outliers = torch.abs(x - self.mean_per_channel) > 3 * self.std_per_channel
-            self.outliers_per_channel += outliers.sum(dim=0)
+        if self.std_per_channel is not None and self.n_samples > 10:  # Wait until sufficient samples
+            outliers = torch.abs(x - self.mean_per_channel) > 6 * self.std_per_channel
+            self.outliers_per_channel += outliers.sum(dim=0)  # Sum over batch dimension
 
         return x
 
