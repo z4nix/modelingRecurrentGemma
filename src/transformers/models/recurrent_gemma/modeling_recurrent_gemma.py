@@ -46,6 +46,9 @@ _MAX_SQRT_GRADIENT = 1000.0
 import torch
 import torch.nn as nn
 
+import torch
+import torch.nn as nn
+
 class Recorder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -58,44 +61,53 @@ class Recorder(nn.Module):
         self.outliers_per_channel = None  # Track outliers
 
     def forward(self, x):
+        B, *rest = x.shape
+        if len(rest) == 2:
+            T, D = rest
+        else:
+            D = rest[0]
+        
+        # Aggregate batch and sequence dimensions for statistics 
+        x_reshaped = x.view(B * T, D) if len(rest) == 2 else x
+        
         if self.n_samples == 0:
             # Initialize statistics on first batch
-            self.min_per_channel = x.clone()
-            self.max_per_channel = x.clone()
-            self.mean_per_channel = x.clone()
-            self.m2_per_channel = torch.zeros_like(x)  # Initialize for variance tracking
-            self.outliers_per_channel = torch.zeros_like(x)  # Initialize outlier count
+            self.min_per_channel = x_reshaped.clone().min(dim=0).values
+            self.max_per_channel = x_reshaped.clone().max(dim=0).values
+            self.mean_per_channel = x_reshaped.mean(dim=0)
+            self.m2_per_channel = torch.zeros(D, device=x.device)  # Initialize for variance tracking
+            self.outliers_per_channel = torch.zeros(D, device=x.device)  # Initialize outlier count
         else:
             # Update min and max per channel
-            self.min_per_channel = torch.min(x, self.min_per_channel)
-            self.max_per_channel = torch.max(x, self.max_per_channel)
+            self.min_per_channel = torch.min(x_reshaped.min(dim=0).values, self.min_per_channel)
+            self.max_per_channel = torch.max(x_reshaped.max(dim=0).values, self.max_per_channel)
 
             # Update mean using Welford's algorithm
-            delta = x - self.mean_per_channel
+            delta = x_reshaped.mean(dim=0) - self.mean_per_channel
             self.mean_per_channel += delta / (self.n_samples + 1)
 
-            # Update M2 (sum of squared differences)
-            delta2 = x - self.mean_per_channel
+            # Update M2 (sum of squared differences for variance)
+            delta2 = x_reshaped.mean(dim=0) - self.mean_per_channel
             self.m2_per_channel += delta * delta2
 
         self.n_samples += 1
 
         # Calculate standard deviation from variance (sample variance)
         if self.n_samples > 1:
-            variance = self.m2_per_channel / (self.n_samples - 1)  # Use sample variance
+            variance = self.m2_per_channel / (self.n_samples - 1)
             self.std_per_channel = torch.sqrt(variance)
         else:
-            self.std_per_channel = torch.zeros_like(x)
+            self.std_per_channel = torch.zeros(D, device=x.device)
 
         if self.std_per_channel is not None and self.n_samples > 10:  # Wait until sufficient samples
-            outliers = torch.abs(x - self.mean_per_channel) > 6 * self.std_per_channel
+            # Check for outliers: values more than 6 * std from the mean
+            outliers = torch.abs(x_reshaped - self.mean_per_channel) > 6 * self.std_per_channel
             self.outliers_per_channel += outliers.sum(dim=0)  # Sum over batch dimension
 
         return x
 
 
-
-# Copied from transformers.models.gemma.modeling_gemma.GemmaRMSNorm with Gemma->RecurrentGemma
+# Modified RecurrentGemmaRMSNorm class with Recorder tracking
 class RecurrentGemmaRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -108,16 +120,16 @@ class RecurrentGemmaRMSNorm(nn.Module):
 
     def forward(self, x):
         output = self._norm(x.float())
-        # Llama does x.to(float16) * w whilst RecurrentGemma is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
+        # Apply weight adjustment
         output = output * (1.0 + self.weight.float())
 
-        #DZ Recorder
+        # Record activations
         self.recorder(x)
         return output.type_as(x)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
 
 
 ALL_LAYERNORM_LAYERS.append(RecurrentGemmaRMSNorm)
