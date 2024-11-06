@@ -868,13 +868,14 @@ class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
           # Remove only attention-specific temporal blocks
           for layer in model.layers:  # Access layers directly instead of model.decoder.layers
               if isinstance(layer.temporal_block, RecurrentGemmaSdpaAttention):
-                  layer.temporal_block = None  # Remove attention temporal block
+                for param in layer.temporal_block.parameters():
+                    param.data.zero_()  # Zero out weights and biases     
       elif lenses == "no_mlp":
           # Remove MLP layers in attention blocks
           for layer in model.layers:
               if isinstance(layer.temporal_block, RecurrentGemmaSdpaAttention):
-                  layer.mlp_block = None  # Remove the MLP block in attention blocks
-
+                for param in layer.temporal_block.parameters():
+                    param.data.zero_()  # Zero out weights and biases 
       return model
 
 
