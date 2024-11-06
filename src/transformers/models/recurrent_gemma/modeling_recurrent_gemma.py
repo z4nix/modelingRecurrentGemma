@@ -856,29 +856,27 @@ class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
         self.post_init()
 
     def _initialize_model(self, config, lenses: Optional[str]):
-        """
-        Configures the model based on the `lenses` argument.
-        
-        - If lenses == 'no_attention', removes the attention layer (temporal block).
-        - If lenses == 'no_mlp', removes MLP layers in the attention block.
-        - Otherwise, initializes the default RecurrentGemmaModel.
-        """
-        model = RecurrentGemmaModel(config)
-        
-        if lenses == "no_attention":
-            # Remove the attention layer (temporal block) from all decoder layers
-            for layer in model.decoder.layers:
-                 if isinstance(layer.temporal_block, RecurrentGemmaSdpaAttention):
-                    layer.temporal_block = None  # Remove attention temporal block
-        elif lenses == "no_mlp":
-            # Remove MLP layers from attention blocks
-            for layer in model.decoder.layers:
-                if isinstance(layer.temporal_block, RecurrentGemmaSdpaAttention):
-                    layer.mlp = None  # Remove MLP blocks
-                    layer.temporal_block = None  # Remove attention temporal block
+      """
+      Configures the model based on the `lenses` argument.
 
-            
-        return model
+      - If lenses == 'no_attention', removes only attention-specific temporal blocks (e.g., RecurrentGemmaSdpaAttention).
+      - If lenses == 'no_mlp', removes only MLP layers in the attention blocks.
+      - Otherwise, initializes the default RecurrentGemmaModel.
+      """
+      model = RecurrentGemmaModel(config)
+      if lenses == "no_attention":
+          # Remove only attention-specific temporal blocks
+          for layer in model.layers:  # Access layers directly instead of model.decoder.layers
+              if isinstance(layer.temporal_block, RecurrentGemmaSdpaAttention):
+                  layer.temporal_block = None  # Remove attention temporal block
+      elif lenses == "no_mlp":
+          # Remove MLP layers in attention blocks
+          for layer in model.layers:
+              if isinstance(layer.temporal_block, RecurrentGemmaSdpaAttention):
+                  layer.mlp_block = None  # Remove the MLP block in attention blocks
+
+      return model
+
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
