@@ -846,14 +846,35 @@ class RecurrentGemmaModel(RecurrentGemmaPreTrainedModel):
 class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, lenses: Optional[str] = None):
         super().__init__(config)
-        self.model = RecurrentGemmaModel(config)
+        self.model = self._initialize_model(config, lenses)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _initialize_model(self, config, lenses: Optional[str]):
+        """
+        Configures the model based on the `lenses` argument.
+        
+        - If lenses == 'no_attention', removes the attention layer (temporal block).
+        - If lenses == 'no_mlp', removes MLP layers in the attention block.
+        - Otherwise, initializes the default RecurrentGemmaModel.
+        """
+        model = RecurrentGemmaModel(config)
+        
+        if lenses == "no_attention":
+            # Remove the attention layer (temporal block) from all decoder layers
+            for layer in model.decoder.layers:
+                layer.temporal_block = None  # Remove temporal block entirely
+        elif lenses == "no_mlp":
+            # Remove MLP layers from attention blocks
+            for layer in model.decoder.layers:
+                layer.mlp = None  # Remove MLP blocks
+            
+        return model
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -873,7 +894,6 @@ class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
-    # Ignore copy
     @add_start_docstrings_to_model_forward(RECURRENTGEMMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -888,31 +908,6 @@ class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         use_cache: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutput]:
-        r"""
-        Args:
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, RecurrentGemmaForCausalLM
-
-        >>> model = RecurrentGemmaForCausalLM.from_pretrained("google/recurrentgemma-2b")
-        >>> tokenizer = AutoTokenizer.from_pretrained("google/recurrentgemma-2b")
-
-        >>> prompt = "What is your favorite condiment?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "What is your favorite condiment?"
-        ```"""
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -932,22 +927,19 @@ class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
-        # Soft-cap the logits TODO remove if always done.
-        # if self.config.logits_soft_cap is not None:
+        # Apply optional soft cap to logits
         cap = self.config.logits_soft_cap
-        logits = nn.functional.tanh(logits / cap) * cap
+        logits = nn.functional.tanh(logits / cap) * cap if cap is not None else logits
 
         logits = logits.float()
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
+            # Compute loss
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
             loss_fct = CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
 
@@ -960,6 +952,7 @@ class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
             logits=logits,
             hidden_states=outputs.hidden_states,
         )
+
 
     # Ignore copy
     def prepare_inputs_for_generation(
