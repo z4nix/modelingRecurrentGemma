@@ -841,43 +841,39 @@ class RecurrentGemmaModel(RecurrentGemmaPreTrainedModel):
 
         return causal_mask
 
-
+import os
 # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM with LLAMA->RECURRENTGEMMA,Llama->RecurrentGemma,llama->gemma
 class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config, lenses: Optional[str] = None):
         super().__init__(config)
+            
         self.model = self._initialize_model(config, lenses)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        self.lenses = lenses
         # Initialize weights and apply final processing
         self.post_init()
+        
 
     def _initialize_model(self, config, lenses: Optional[str]):
-      """
-      Configures the model based on the `lenses` argument.
-
-      - If lenses == 'no_attention', removes only attention-specific temporal blocks (e.g., RecurrentGemmaSdpaAttention).
-      - If lenses == 'no_mlp', removes only MLP layers in the attention blocks.
-      - Otherwise, initializes the default RecurrentGemmaModel.
-      """
       model = RecurrentGemmaModel(config)
-      if lenses == "no_attention":
-          # Remove only attention-specific temporal blocks
-          for layer in model.layers:  # Access layers directly instead of model.decoder.layers
-              if isinstance(layer.temporal_block, RecurrentGemmaSdpaAttention):
-                for param in layer.temporal_block.parameters():
-                    param.data.zero_()  # Zero out weights and biases     
-      elif lenses == "no_mlp":
-          # Remove MLP layers in attention blocks
-          for layer in model.layers:
-              if isinstance(layer.temporal_block, RecurrentGemmaSdpaAttention):
-                for param in layer.temporal_block.parameters():
-                    param.data.zero_()  # Zero out weights and biases 
       return model
 
+    def _apply_lenses(self):
+      """Zeroes out the parameters based on the lenses argument."""
+      if self.lenses == "no_attention":
+          for layer in self.model.layers:
+              if isinstance(layer.temporal_block, RecurrentGemmaSdpaAttention):
+                  for param in layer.temporal_block.parameters():
+                      param.data.zero_()  # Zero out weights and biases
+                     # param.requires_grad = False  # Freeze the parameter
+      elif self.lenses == "no_mlp":
+          for layer in self.model.layers:
+              if isinstance(layer.temporal_block, RecurrentGemmaSdpaAttention):
+                  for param in layer.temporal_block.parameters():
+                      param.data.zero_()  # Zero out weights and biases
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
