@@ -898,7 +898,28 @@ class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
               if isinstance(layer.temporal_block, RecurrentGemmaRecurrentBlock):
                   for param in layer.mlp_block.parameters():
                       param.data.zero_()  # Zero out weights and biases
-                      
+
+      elif self.lenses in {"no_every_second_rnn_and_mlp", "no_every_second_rnn", "no_every_second_mlp_in_rnn"}:
+        for i, layer in enumerate(self.model.layers):
+            if isinstance(layer.temporal_block, RecurrentGemmaRecurrentBlock):
+                if self.lenses == "no_every_second_rnn_and_mlp":
+                    if i % 2 == 1:
+                        # Remove RNN and MLP block
+                        for param in layer.temporal_block.parameters():
+                            param.data.zero_()  # Zero out weights and biases
+                        for param in layer.mlp_block.parameters():
+                            param.data.zero_()  # Zero out weights and biases
+                elif self.lenses == "no_every_second_rnn":
+                    if i % 2 == 1:
+                        # Remove only RNN block
+                        for param in layer.temporal_block.parameters():
+                            param.data.zero_()  # Zero out weights and biases
+                elif self.lenses == "no_every_second_mlp_in_rnn":
+                    if i % 2 == 1:
+                        # Remove only MLP block
+                        for param in layer.mlp_block.parameters():
+                            param.data.zero_()  # Zero out weights and biases   
+                                    
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
