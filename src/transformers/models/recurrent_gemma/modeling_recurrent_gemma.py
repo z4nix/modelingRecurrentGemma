@@ -61,34 +61,31 @@ class Recorder(nn.Module):
         self.outliers_per_channel = None  # Track outliers
 
     def forward(self, x):
-        B, *rest = x.shape
-        if len(rest) == 2:
-            T, D = rest
-        else:
-            D = rest[0]
-        
-        # Aggregate batch and sequence dimensions for statistics 
-        x_reshaped = x.view(B * T, D) if len(rest) == 2 else x
-        
+        # Assume x has shape [B, H, T, D] or [B, T, D]
+        x_dims = x.shape
+        B, *rest = x_dims  # Preserve all other dimensions
+        last_dim = rest[-1]  # Feature dimension (D)
+
         if self.n_samples == 0:
-            # Initialize statistics on first batch
-            self.min_per_channel = x_reshaped.clone().min(dim=0).values
-            self.max_per_channel = x_reshaped.clone().max(dim=0).values
-            self.mean_per_channel = x_reshaped.mean(dim=0)
-            self.m2_per_channel = torch.zeros(D, device=x.device)  # Initialize for variance tracking
-            self.outliers_per_channel = torch.zeros(D, device=x.device)  # Initialize outlier count
+        # Initialize statistics with the shape of rest[:-1] + [D]
+          self.min_per_channel = x.min(dim=0, keepdim=False).values
+          self.max_per_channel = x.max(dim=0, keepdim=False).values
+          self.mean_per_channel = x.mean(dim=0, keepdim=False)
+          self.m2_per_channel = torch.zeros_like(self.mean_per_channel)  # Correct shape
+          self.outliers_per_channel = torch.zeros_like(self.mean_per_channel)  # Correct shape
         else:
-            # Update min and max per channel
-            self.min_per_channel = torch.min(x_reshaped.min(dim=0).values, self.min_per_channel)
-            self.max_per_channel = torch.max(x_reshaped.max(dim=0).values, self.max_per_channel)
+          # Update min and max per channel across batch dimension
+          self.min_per_channel = torch.min(x.min(dim=0, keepdim=False).values, self.min_per_channel)
+          self.max_per_channel = torch.max(x.max(dim=0, keepdim=False).values, self.max_per_channel)
 
-            # Update mean using Welford's algorithm
-            delta = x_reshaped.mean(dim=0) - self.mean_per_channel
-            self.mean_per_channel += delta / (self.n_samples + 1)
+          # Update mean using Welford's algorithm
+          delta = x.mean(dim=0, keepdim=False) - self.mean_per_channel
+          self.mean_per_channel += delta / (self.n_samples + 1)
 
-            # Update M2 (sum of squared differences for variance)
-            delta2 = x_reshaped.mean(dim=0) - self.mean_per_channel
-            self.m2_per_channel += delta * delta2
+          # Update M2 (sum of squared differences for variance)
+          delta2 = x.mean(dim=0, keepdim=False) - self.mean_per_channel
+          self.m2_per_channel += delta * delta2
+
 
         self.n_samples += 1
 
@@ -97,12 +94,13 @@ class Recorder(nn.Module):
             variance = self.m2_per_channel / (self.n_samples - 1)
             self.std_per_channel = torch.sqrt(variance)
         else:
-            self.std_per_channel = torch.zeros(D, device=x.device)
+            self.std_per_channel = torch.zeros(rest, device=x.device)
 
-        if self.std_per_channel is not None and self.n_samples > 10:  # Wait until sufficient samples
-            # Check for outliers: values more than 6 * std from the mean
-            outliers = torch.abs(x_reshaped - self.mean_per_channel) > 6 * self.std_per_channel
-            self.outliers_per_channel += outliers.sum(dim=0)  # Sum over batch dimension
+        # Track outliers after sufficient samples
+        if self.std_per_channel is not None and self.n_samples > 10:
+            # Check for outliers: values > 6 * std from mean
+            outliers = torch.abs(x - self.mean_per_channel) > 6 * self.std_per_channel
+            self.outliers_per_channel += outliers.sum(dim=0)  # Sum across batch dimension
 
         return x
 
@@ -233,6 +231,14 @@ class RecurrentGemmaSdpaAttention(nn.Module):
             int(self.partial_rotary_factor * self.head_dim),
             base=config.rope_theta,
         )
+        # Recorders
+        self.input_recorder = Recorder()
+        self.query_recorder = Recorder()
+        self.key_recorder = Recorder()
+        self.value_recorder = Recorder()
+        self.post_rotary_recorder = Recorder()
+        self.attention_output_recorder = Recorder()
+        self.final_output_recorder = Recorder()
 
     def forward(
         self,
@@ -243,10 +249,17 @@ class RecurrentGemmaSdpaAttention(nn.Module):
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
+        #DZ input recorder
+        self.input_recorder(hidden_states)
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+
+        # DZ Record projections
+        self.query_recorder(query_states)
+        self.key_recorder(key_states)
+        self.value_recorder(value_states)
 
         query_states = query_states.view(bsz, q_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -254,12 +267,18 @@ class RecurrentGemmaSdpaAttention(nn.Module):
 
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
 
+
         # Partial rotary embedding
         query_rot, query_pass = torch.chunk(query_states, int(1 / self.partial_rotary_factor), dim=-1)
         key_rot, key_pass = torch.chunk(key_states, int(1 / self.partial_rotary_factor), dim=-1)
         query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, position_ids)
         query_states = torch.cat((query_rot, query_pass), dim=-1)
         key_states = torch.cat((key_rot, key_pass), dim=-1)
+        print(f"query_states shape: {query_states.shape}")  # Should be (batch_size, num_heads, seq_len, head_dim)
+
+        # DZ Record post-rotary embedding states
+        self.post_rotary_recorder(query_states)
+        self.post_rotary_recorder(key_states)
 
         if use_cache and hasattr(self, "key_states"):
             cache_kwargs = {"cache_position": cache_position}
@@ -283,7 +302,14 @@ class RecurrentGemmaSdpaAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+
+        # DZ Record attention output
+        self.attention_output_recorder(attn_output)
+
         attn_output = self.o_proj(attn_output)
+
+        # DZ Record final output after o_proj
+        self.final_output_recorder(attn_output)
         return attn_output
 
     def _setup_cache(self, batch_size, device, dtype=None):
