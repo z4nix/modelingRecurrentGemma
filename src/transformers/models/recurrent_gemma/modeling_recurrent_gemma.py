@@ -396,6 +396,15 @@ class RecurrentGemmaRglru(nn.Module):
         self.recurrent_gate_bias = nn.Parameter(torch.empty([self.num_attention_heads, self.block_width]))
         self.recurrent_states = None
 
+        #DZ Initializing Recorders
+        self.input_gate_recorder = Recorder()
+        self.recurrent_gate_recorder = Recorder()
+        self.gated_inputs_recorder = Recorder()
+        self.norm_recorder = Recorder()
+        self.scan_recorder = Recorder()
+
+
+
     def forward(
         self,
         activations: torch.Tensor,
@@ -410,8 +419,16 @@ class RecurrentGemmaRglru(nn.Module):
         res = torch.baddbmm(self.input_gate_bias[:, None, :], reshape_act, self.input_gate_weight)
         input_gate = torch.sigmoid(res.transpose(0, 1).reshape(batch_size, seq_len, lru_width))
 
+        #DZ input_gate_recorder 
+        self.input_gate_recorder(input_gate)
+
+
         res = torch.baddbmm(self.recurrent_gate_bias[:, None, :], reshape_act, self.recurrent_gate_weight)
         recurrent_gate = torch.sigmoid(res.transpose(0, 1).reshape(batch_size, seq_len, lru_width))
+
+        #DZ recurrent_gate_recorder
+        self.recurrent_gate_recorder(recurrent_gate)
+
 
         # Compute the parameter `A` of the recurrence.
         log_recurrent_gate = -8.0 * recurrent_gate * nn.functional.softplus(self.recurrent_param)
@@ -421,6 +438,8 @@ class RecurrentGemmaRglru(nn.Module):
         # Gate the input.
         gated_inputs = activations * input_gate
 
+        #DZ gated_inputs_recorder
+        self.gated_inputs_recorder(gated_inputs)
         # Apply gamma normalization to the input. We need to clip the derivatives of
         # `sqrt` in order to prevent NaNs during training in bfloat16. TODO a bit annoying
         multiplier = 1
@@ -430,12 +449,19 @@ class RecurrentGemmaRglru(nn.Module):
         multiplier = reset + ~reset * multiplier
         normalized_x = gated_inputs * multiplier.type(activations.dtype)
 
+        #DZ norm_recorder
+        self.norm_recorder(normalized_x)
+
         hidden_states, recurrent_states = self._rnn_scan(
             hidden_states=normalized_x,
             recurrent_gate=recurrent_gate,
             reset=reset,
             recurrent_states=self.recurrent_states,
         )
+
+        #DZ scan_recorder
+        self.scan_recorder(hidden_states)
+
         self.recurrent_states = recurrent_states
         return hidden_states
 
@@ -513,6 +539,16 @@ class RecurrentGemmaRecurrentBlock(nn.Module):
 
         self.conv1d_state = None
 
+        #DZ initialize Recorders
+        self.y_gate_recorder = Recorder()
+        self.x_initial_recorder = Recorder()
+        self.x_conv_recorder = Recorder()
+        self.x_rglru_recorder = Recorder()
+        self.gated_recorder = Recorder()
+        self.final_recorder = Recorder()
+
+
+
     def forward(
         self,
         input_states: torch.Tensor,
@@ -526,13 +562,22 @@ class RecurrentGemmaRecurrentBlock(nn.Module):
         y_branch = self.linear_y(input_states)
         y_branch = self.act_fn(y_branch)
 
+        #DZ y_branch_recorder (simple gating path)
+        self.y_gate_recorder(y_branch)
+
         x_branch = self.linear_x(input_states)
         x_branch = x_branch.transpose(1, 2)
+
+        #DZ x_branch_recorder (main processing path)
+        self.x_initial_recorder(x_branch)
 
         if use_cache:
             if cache_position.shape[0] != 1:  # prefill
                 self.conv1d_state = nn.functional.pad(x_branch, (self.conv1d_width - x_branch.shape[-1] - 1, 0))
                 x_branch = self.conv_1d(x_branch)[..., :seq_len]
+                #DZ  x_conv_recorder (after convolution)
+                self.x_conv_recorder(x_branch)
+
             else:  # decoding
                 conv_state = torch.cat((self.conv1d_state, x_branch), -1)
                 x_branch = torch.sum(conv_state * self.conv_1d.weight[:, 0, :], dim=-1) + self.conv_1d.bias
@@ -542,9 +587,19 @@ class RecurrentGemmaRecurrentBlock(nn.Module):
             x_branch = self.conv_1d(x_branch)[..., :seq_len]
 
         x_branch = self.rg_lru(x_branch.transpose(1, 2), position_ids)
+        
+        #DZ x_rglru_recorder (after rglru)
+        self.x_rglru_recorder(x_branch)
 
         hidden_states = x_branch * y_branch
+        
+        #DZ gated_recorder (after gate multiplication Y-branch acts as a gate for X-branch)
+        self.gated_recorder(hidden_states)
+    
         hidden_states = self.linear_out(hidden_states)
+
+        #DZ final_recorder (final output)
+        self.final_recorder(hidden_states)
         return hidden_states
 
     def _setup_cache(self, batch, device, dtype):
