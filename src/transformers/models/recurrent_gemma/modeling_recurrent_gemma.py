@@ -622,9 +622,39 @@ class RecurrentGemmaMlp(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
         self.act_fn = ACT2FN[config.hidden_activation]
 
+        #DZ initialize Recorders
+        self.input_recorder = Recorder()        
+        self.gate_recorder = Recorder()         
+        self.up_recorder = Recorder()          
+        self.gated_up_recorder = Recorder()     
+        self.output_recorder = Recorder()    
+
     def forward(self, hidden_states):
+        '''
+         # DZ Seprated in order to add recorder in between, original was 
+        def forward(self, hidden_states):
+            gate = self.act_fn(self.gate_proj(hidden_states))
+            return self.down_proj(gate * self.up_proj(hidden_states))
+        '''
+        self.input_recorder(hidden_states)
+    
         gate = self.act_fn(self.gate_proj(hidden_states))
-        return self.down_proj(gate * self.up_proj(hidden_states))
+        # DZ Record gate after activation
+        self.gate_recorder(gate)
+    
+        up = self.up_proj(hidden_states)
+        # DZ Record up projection
+        self.up_recorder(up)
+    
+        gated = gate * up
+        # DZ Record after multiplication
+        self.gated_up_recorder(gated)
+    
+        output = self.down_proj(gated)
+        # DZ Record final output
+        self.output_recorder(output)
+        
+        return output
 
 
 class RecurrentGemmaDecoderLayer(nn.Module):
