@@ -97,7 +97,7 @@ class Recorder(nn.Module):
             self.std_per_channel = torch.zeros(rest, device=x.device)
 
         # Track outliers after sufficient samples
-        if self.std_per_channel is not None and self.n_samples > 10:
+        if self.std_per_channel is not None:
             # Check for outliers: values > 6 * std from mean
             outliers = torch.abs(x - self.mean_per_channel) > 6 * self.std_per_channel
             self.outliers_per_channel += outliers.sum(dim=0)  # Sum across batch dimension
