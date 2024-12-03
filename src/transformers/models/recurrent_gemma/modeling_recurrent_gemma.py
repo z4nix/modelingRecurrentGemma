@@ -50,59 +50,52 @@ import torch
 import torch.nn as nn
 
 class Recorder(nn.Module):
-    def __init__(self):
+    def __init__(self, calibrating=True, std_threshold=None):
         super().__init__()
+        self.calibrating = calibrating
+        self.std_threshold = std_threshold
         self.n_samples = 0
         self.min_per_channel = None
         self.max_per_channel = None
         self.mean_per_channel = None
-        self.m2_per_channel = None  # For variance calculation
+        self.m2_per_channel = None
         self.std_per_channel = None
-        self.outliers_per_channel = None  # Track outliers
+        self.outliers_per_channel = None
+        self.ratio_clipped_vals = []
+        self.threshold_low = None
+        self.threshold_high = None
 
     def forward(self, x):
-        # Assume x has shape [B, H, T, D] or [B, T, D]
-        x_dims = x.shape
-        B, *rest = x_dims  # Preserve all other dimensions
-        last_dim = rest[-1]  # Feature dimension (D)
+        if self.calibrating:
+            if self.n_samples == 0:
+                self.min_per_channel = x.min(dim=0, keepdim=False).values
+                self.max_per_channel = x.max(dim=0, keepdim=False).values
+                self.mean_per_channel = x.mean(dim=0, keepdim=False)
+                self.m2_per_channel = torch.zeros_like(self.mean_per_channel)
+                self.outliers_per_channel = torch.zeros_like(self.mean_per_channel)
+            else:
+                self.min_per_channel = torch.min(x.min(dim=0, keepdim=False).values, self.min_per_channel)
+                self.max_per_channel = torch.max(x.max(dim=0, keepdim=False).values, self.max_per_channel)
+                delta = x.mean(dim=0, keepdim=False) - self.mean_per_channel
+                self.mean_per_channel += delta / (self.n_samples + 1)
+                delta2 = x.mean(dim=0, keepdim=False) - self.mean_per_channel
+                self.m2_per_channel += delta * delta2
 
-        if self.n_samples == 0:
-        # Initialize statistics with the shape of rest[:-1] + [D]
-          self.min_per_channel = x.min(dim=0, keepdim=False).values
-          self.max_per_channel = x.max(dim=0, keepdim=False).values
-          self.mean_per_channel = x.mean(dim=0, keepdim=False)
-          self.m2_per_channel = torch.zeros_like(self.mean_per_channel)  # Correct shape
-          self.outliers_per_channel = torch.zeros_like(self.mean_per_channel)  # Correct shape
+            self.n_samples += 1
+
+            if self.n_samples > 1:
+                variance = self.m2_per_channel / (self.n_samples - 1)
+                self.std_per_channel = torch.sqrt(variance)
+                if self.std_threshold is not None:
+                    self.threshold_low = self.mean_per_channel - self.std_per_channel * self.std_threshold
+                    self.threshold_high = self.mean_per_channel + self.std_per_channel * self.std_threshold
+            return x
         else:
-          # Update min and max per channel across batch dimension
-          self.min_per_channel = torch.min(x.min(dim=0, keepdim=False).values, self.min_per_channel)
-          self.max_per_channel = torch.max(x.max(dim=0, keepdim=False).values, self.max_per_channel)
-
-          # Update mean using Welford's algorithm
-          delta = x.mean(dim=0, keepdim=False) - self.mean_per_channel
-          self.mean_per_channel += delta / (self.n_samples + 1)
-
-          # Update M2 (sum of squared differences for variance)
-          delta2 = x.mean(dim=0, keepdim=False) - self.mean_per_channel
-          self.m2_per_channel += delta * delta2
-
-
-        self.n_samples += 1
-
-        # Calculate standard deviation from variance (sample variance)
-        if self.n_samples > 1:
-            variance = self.m2_per_channel / (self.n_samples - 1)
-            self.std_per_channel = torch.sqrt(variance)
-        else:
-            self.std_per_channel = torch.zeros(rest, device=x.device)
-
-        # Track outliers after sufficient samples
-        if self.std_per_channel is not None:
-            # Check for outliers: values > 6 * std from mean
-            outliers = torch.abs(x - self.mean_per_channel) > 6 * self.std_per_channel
-            self.outliers_per_channel += outliers.sum(dim=0)  # Sum across batch dimension
-
-        return x
+            if self.threshold_low is not None and self.threshold_high is not None:
+                clamped_x = torch.clamp(x, self.threshold_low, self.threshold_high)
+                self.ratio_clipped_vals.append((x != clamped_x).sum().item() / x.numel())
+                return clamped_x
+            return x
 
 
 # Modified RecurrentGemmaRMSNorm class with Recorder tracking
@@ -121,14 +114,21 @@ class RecurrentGemmaRMSNorm(nn.Module):
         # Apply weight adjustment
         output = output * (1.0 + self.weight.float())
 
+        # Debug before recorder
+        print(f"\nBefore recorder - min: {output.min().item():.4f}, max: {output.max().item():.4f}")
+        
         # Record activations
-        self.recorder(x)
+        output = self.recorder(output)
+        
+        # Debug after recorder
+        print(f"After recorder - min: {output.min().item():.4f}, max: {output.max().item():.4f}")
+        if hasattr(self.recorder, 'threshold_low') and self.recorder.threshold_low is not None:
+            print(f"Thresholds - low: {self.recorder.threshold_low.mean().item():.4f}, high: {self.recorder.threshold_high.mean().item():.4f}")
+        
         return output.type_as(x)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
-
 
 ALL_LAYERNORM_LAYERS.append(RecurrentGemmaRMSNorm)
 
