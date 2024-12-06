@@ -104,29 +104,32 @@ class RecurrentGemmaRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        self.recorder = Recorder()
-
+        self.input_recorder = Recorder()  # Monitor input values
+        self.output_recorder = Recorder()  # Monitor/clip output values
+    
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
+    
     def forward(self, x):
+        # Record input values for outlier detection
+        self.input_recorder(x)
+        
         output = self._norm(x.float())
-        # Apply weight adjustment
         output = output * (1.0 + self.weight.float())
-
+        
         # Debug before recorder
         print(f"\nBefore recorder - min: {output.min().item():.4f}, max: {output.max().item():.4f}")
         
-        # Record activations
-        output = self.recorder(output)
+        # Record and clip output activations
+        output = self.output_recorder(output)
         
         # Debug after recorder
         print(f"After recorder - min: {output.min().item():.4f}, max: {output.max().item():.4f}")
-        if hasattr(self.recorder, 'threshold_low') and self.recorder.threshold_low is not None:
-            print(f"Thresholds - low: {self.recorder.threshold_low.mean().item():.4f}, high: {self.recorder.threshold_high.mean().item():.4f}")
+        if hasattr(self.output_recorder, 'threshold_low') and self.output_recorder.threshold_low is not None:
+            print(f"Thresholds - low: {self.output_recorder.threshold_low.mean().item():.4f}, high: {self.output_recorder.threshold_high.mean().item():.4f}")
         
         return output.type_as(x)
-
+    
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
