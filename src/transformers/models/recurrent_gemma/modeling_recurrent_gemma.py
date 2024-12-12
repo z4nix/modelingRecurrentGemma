@@ -294,13 +294,15 @@ class RecurrentGemmaSdpaAttention(nn.Module):
         if attention_mask is not None:
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
+        attn_output, self.attn_weight = torch.nn.functional.scaled_dot_product_attention(
             query_states.contiguous(),
             key_states.contiguous(),
             value_states.contiguous(),
-            attn_mask=causal_mask,  # pretty much a must for sliding window backend!
+            attn_mask=causal_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             scale=self.head_dim**-0.5,
+            need_weights=True,
+            average_heads=False
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
