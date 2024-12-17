@@ -294,16 +294,17 @@ class RecurrentGemmaSdpaAttention(nn.Module):
         if attention_mask is not None:
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
-        attn_output, self.attn_weight = torch.nn.functional.scaled_dot_product_attention(
+        attention_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
+    
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states.contiguous(),
             key_states.contiguous(),
             value_states.contiguous(),
             attn_mask=causal_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             scale=self.head_dim**-0.5,
-            need_weights=True,
-            average_heads=False
         )
+
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
@@ -315,7 +316,7 @@ class RecurrentGemmaSdpaAttention(nn.Module):
 
         # DZ Record final output after o_proj
         self.final_output_recorder(attn_output)
-        return attn_output
+        return attn_output, attention_weights
 
     def _setup_cache(self, batch_size, device, dtype=None):
         if dtype is None and self.config.torch_dtype is not None:
