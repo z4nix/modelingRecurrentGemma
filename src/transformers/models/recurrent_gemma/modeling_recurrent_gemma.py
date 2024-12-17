@@ -926,6 +926,7 @@ class RecurrentGemmaModel(RecurrentGemmaPreTrainedModel):
         return BaseModelOutputWithNoAttention(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
+            attentions=all_attentions,
         )
 
     # Ignore copy
