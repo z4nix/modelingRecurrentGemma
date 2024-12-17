@@ -20,7 +20,7 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
-from torch import nn
+from torch import NoneType, nn
 from torch.nn import CrossEntropyLoss
 
 from ...activations import ACT2FN
@@ -673,27 +673,25 @@ class RecurrentGemmaDecoderLayer(nn.Module):
         self.channel_pre_norm = RecurrentGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp_block = RecurrentGemmaMlp(config)
 
-    def forward(
-        self,
-        activations: torch.Tensor,
-        position_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        cache_position: torch.Tensor = None,
-        use_cache: bool = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self, activations, position_ids, attention_mask, cache_position=None, use_cache=None):
         raw_activations = activations
-        inputs_normalized = self.temporal_pre_norm(raw_activations)  # RMSNorm introduces slight slight differences
+        inputs_normalized = self.temporal_pre_norm(raw_activations)
 
-        hidden_states = self.temporal_block(
-            inputs_normalized, position_ids, attention_mask, cache_position=cache_position, use_cache=use_cache
-        )
+        if isinstance(self.temporal_block, RecurrentGemmaSdpaAttention):
+            hidden_states, attention_weights = self.temporal_block(
+                inputs_normalized, position_ids, attention_mask, cache_position, use_cache
+            )
+            self.last_attention_weights = attention_weights
+        else:
+            hidden_states = self.temporal_block(
+                inputs_normalized, position_ids, attention_mask, cache_position, use_cache
+            )
 
         residual = hidden_states + raw_activations
-
         hidden_states = self.channel_pre_norm(residual)
         hidden_states = self.mlp_block(hidden_states)
-
         hidden_states = hidden_states + residual
+
         return hidden_states
 
 
@@ -878,6 +876,8 @@ class RecurrentGemmaModel(RecurrentGemmaPreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Initialize all_attentions list
+        all_attentions = []  # Add this line
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -913,21 +913,26 @@ class RecurrentGemmaModel(RecurrentGemmaPreTrainedModel):
                     residual_block.__call__, hidden_states, position_ids, causal_mask, cache_position, use_cache
                 )
             else:
-                hidden_states = residual_block(hidden_states, position_ids, causal_mask, cache_position, use_cache)
+                hidden_states = residual_block(
+                    hidden_states, position_ids, causal_mask, cache_position, use_cache
+                )
+                if isinstance(residual_block.temporal_block, RecurrentGemmaSdpaAttention):
+                    if hasattr(residual_block, 'last_attention_weights'):
+                        all_attentions.append(residual_block.last_attention_weights)
 
         hidden_states = self.final_norm(hidden_states)
+
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states] if v is not None)
+            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
 
         return BaseModelOutputWithNoAttention(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
-            attentions=all_attentions,
         )
 
     # Ignore copy
