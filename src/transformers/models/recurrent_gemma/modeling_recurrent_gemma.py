@@ -116,12 +116,12 @@ class RecurrentGemmaRMSNorm(nn.Module):
         output = self._norm(x.float())
         output = output * (1.0 + self.weight.float())
         
-        if self.output_recorder.calibrating:
+        if self.output_recorder.calibrating == False:
             print(f"\nBefore recorder - min: {output.min().item():.4f}, max: {output.max().item():.4f}")
         
         output = self.output_recorder(output)
         
-        if self.output_recorder.calibrating:
+        if self.output_recorder.calibrating == False:
             print(f"After recorder - min: {output.min().item():.4f}, max: {output.max().item():.4f}")
             if self.output_recorder.threshold_low is not None:
                 print(f"Thresholds - low: {self.output_recorder.threshold_low.mean().item():.4f}, high: {self.output_recorder.threshold_high.mean().item():.4f}")
@@ -274,7 +274,7 @@ class RecurrentGemmaSdpaAttention(nn.Module):
         query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, position_ids)
         query_states = torch.cat((query_rot, query_pass), dim=-1)
         key_states = torch.cat((key_rot, key_pass), dim=-1)
-        print(f"query_states shape: {query_states.shape}")  # Should be (batch_size, num_heads, seq_len, head_dim)
+        #print(f"query_states shape: {query_states.shape}")  # Should be (batch_size, num_heads, seq_len, head_dim)
 
         # DZ Record post-rotary embedding states
         self.post_rotary_recorder(query_states)
