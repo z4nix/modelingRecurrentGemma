@@ -67,12 +67,15 @@ class Recorder(nn.Module):
 
     def forward(self, x):
         if self.calibrating:
-            if self.n_samples == 0:
+            # Check if dimensions have changed or first initialization
+            if self.n_samples == 0 or self.min_per_channel.size(0) != x.size(-1):
                 self.min_per_channel = x.min(dim=0, keepdim=False).values
                 self.max_per_channel = x.max(dim=0, keepdim=False).values
                 self.mean_per_channel = x.mean(dim=0, keepdim=False)
                 self.m2_per_channel = torch.zeros_like(self.mean_per_channel)
                 self.outliers_per_channel = torch.zeros_like(self.mean_per_channel)
+                self.n_samples = 0  # Reset counter if dimensions changed
+                
             else:
                 self.min_per_channel = torch.min(x.min(dim=0, keepdim=False).values, self.min_per_channel)
                 self.max_per_channel = torch.max(x.max(dim=0, keepdim=False).values, self.max_per_channel)
@@ -80,9 +83,8 @@ class Recorder(nn.Module):
                 self.mean_per_channel += delta / (self.n_samples + 1)
                 delta2 = x.mean(dim=0, keepdim=False) - self.mean_per_channel
                 self.m2_per_channel += delta * delta2
-
+                
             self.n_samples += 1
-
             if self.n_samples > 1:
                 variance = self.m2_per_channel / (self.n_samples - 1)
                 self.std_per_channel = torch.sqrt(variance)
@@ -292,7 +294,7 @@ class RecurrentGemmaSdpaAttention(nn.Module):
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
         attention_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
-    
+        
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states.contiguous(),
             key_states.contiguous(),
