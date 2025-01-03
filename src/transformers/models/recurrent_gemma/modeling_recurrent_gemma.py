@@ -64,37 +64,59 @@ class Recorder(nn.Module):
         self.ratio_clipped_vals = []
         self.threshold_low = None
         self.threshold_high = None
-
+        
     def forward(self, x):
         if self.calibrating:
+            # Handle different input shapes (B,T,D) or (B,D)
+            reduction_dims = (0,1) if len(x.shape) == 3 else (0,)
+            
+            # Calculate current batch statistics
+            current_min = x.min(dim=reduction_dims).values  # Shape: (D,)
+            current_max = x.max(dim=reduction_dims).values  # Shape: (D,)
+            current_mean = x.mean(dim=reduction_dims)  # Shape: (D,)
+            
             # Check if dimensions have changed or first initialization
-            if self.n_samples == 0 or self.min_per_channel.size(0) != x.size(-1):
-                self.min_per_channel = x.min(dim=0, keepdim=False).values
-                self.max_per_channel = x.max(dim=0, keepdim=False).values
-                self.mean_per_channel = x.mean(dim=0, keepdim=False)
+            if self.n_samples == 0 or self.min_per_channel is None:
+                self.min_per_channel = current_min
+                self.max_per_channel = current_max
+                self.mean_per_channel = current_mean
                 self.m2_per_channel = torch.zeros_like(self.mean_per_channel)
                 self.outliers_per_channel = torch.zeros_like(self.mean_per_channel)
-                self.n_samples = 0  # Reset counter if dimensions changed
+                self.n_samples = 0
                 
             else:
-                self.min_per_channel = torch.min(x.min(dim=0, keepdim=False).values, self.min_per_channel)
-                self.max_per_channel = torch.max(x.max(dim=0, keepdim=False).values, self.max_per_channel)
-                delta = x.mean(dim=0, keepdim=False) - self.mean_per_channel
+                # Update min/max
+                self.min_per_channel = torch.min(current_min, self.min_per_channel)
+                self.max_per_channel = torch.max(current_max, self.max_per_channel)
+                
+                # Update running variance using Welford's online algorithm
+                delta = current_mean - self.mean_per_channel
                 self.mean_per_channel += delta / (self.n_samples + 1)
-                delta2 = x.mean(dim=0, keepdim=False) - self.mean_per_channel
+                delta2 = current_mean - self.mean_per_channel
                 self.m2_per_channel += delta * delta2
                 
             self.n_samples += 1
+            
+            # Calculate std after we have at least 2 samples
             if self.n_samples > 1:
                 variance = self.m2_per_channel / (self.n_samples - 1)
                 self.std_per_channel = torch.sqrt(variance)
+                
+                # Update thresholds if std_threshold is set
                 if self.std_threshold is not None:
                     self.threshold_low = self.mean_per_channel - self.std_per_channel * self.std_threshold
                     self.threshold_high = self.mean_per_channel + self.std_per_channel * self.std_threshold
+            
             return x
         else:
             if self.threshold_low is not None and self.threshold_high is not None:
-                clamped_x = torch.clamp(x, self.threshold_low, self.threshold_high)
+                # Broadcast thresholds to match input shape
+                broadcast_shape = [1] * (len(x.shape) - 1) + [-1]  # -1 for the channel dimension
+                threshold_low = self.threshold_low.view(*broadcast_shape)
+                threshold_high = self.threshold_high.view(*broadcast_shape)
+                
+                # Apply thresholds
+                clamped_x = torch.clamp(x, threshold_low, threshold_high)
                 self.ratio_clipped_vals.append((x != clamped_x).sum().item() / x.numel())
                 return clamped_x
             return x
