@@ -50,7 +50,7 @@ import torch
 import torch.nn as nn
 
 class Recorder(nn.Module):
-    def init(self, calibrating=True, std_threshold=None):
+    def __init__(self, calibrating=True, std_threshold=None):
         super().init()
         self.calibrating = calibrating
         self.std_threshold = std_threshold
