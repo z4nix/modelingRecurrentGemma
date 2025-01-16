@@ -65,38 +65,39 @@ class Recorder(nn.Module):
         self.threshold_low = None
         self.threshold_high = None
     def forward(self, x):
-        if self.calibrating:
-            # Check if dimensions have changed or first initialization
-            if self.n_samples == 0 or self.min_per_channel.size(0) != x.size(-1):
-                self.min_per_channel = x.min(dim=0, keepdim=False).values
-                self.max_per_channel = x.max(dim=0, keepdim=False).values
-                self.mean_per_channel = x.mean(dim=0, keepdim=False)
-                self.m2_per_channel = torch.zeros_like(self.mean_per_channel)
-                self.outliers_per_channel = torch.zeros_like(self.mean_per_channel)
-                self.n_samples = 0  # Reset counter if dimensions changed
+        return x
+        # if self.calibrating:
+        #     # Check if dimensions have changed or first initialization
+        #     if self.n_samples == 0 or self.min_per_channel.size(0) != x.size(-1):
+        #         self.min_per_channel = x.min(dim=0, keepdim=False).values
+        #         self.max_per_channel = x.max(dim=0, keepdim=False).values
+        #         self.mean_per_channel = x.mean(dim=0, keepdim=False)
+        #         self.m2_per_channel = torch.zeros_like(self.mean_per_channel)
+        #         self.outliers_per_channel = torch.zeros_like(self.mean_per_channel)
+        #         self.n_samples = 0  # Reset counter if dimensions changed
 
-            else:
-                self.min_per_channel = torch.min(x.min(dim=0, keepdim=False).values, self.min_per_channel)
-                self.max_per_channel = torch.max(x.max(dim=0, keepdim=False).values, self.max_per_channel)
-                delta = x.mean(dim=0, keepdim=False) - self.mean_per_channel
-                self.mean_per_channel += delta / (self.n_samples + 1)
-                delta2 = x.mean(dim=0, keepdim=False) - self.mean_per_channel
-                self.m2_per_channel += delta * delta2
+        #     else:
+        #         self.min_per_channel = torch.min(x.min(dim=0, keepdim=False).values, self.min_per_channel)
+        #         self.max_per_channel = torch.max(x.max(dim=0, keepdim=False).values, self.max_per_channel)
+        #         delta = x.mean(dim=0, keepdim=False) - self.mean_per_channel
+        #         self.mean_per_channel += delta / (self.n_samples + 1)
+        #         delta2 = x.mean(dim=0, keepdim=False) - self.mean_per_channel
+        #         self.m2_per_channel += delta * delta2
 
-            self.n_samples += 1
-            if self.n_samples > 1:
-                variance = self.m2_per_channel / (self.n_samples - 1)
-                self.std_per_channel = torch.sqrt(variance)
-                if self.std_threshold is not None:
-                    self.threshold_low = self.mean_per_channel - self.std_per_channel * self.std_threshold
-                    self.threshold_high = self.mean_per_channel + self.std_per_channel * self.std_threshold
-            return x
-        else:
-            if self.threshold_low is not None and self.threshold_high is not None:
-                clamped_x = torch.clamp(x, self.threshold_low, self.threshold_high)
-                self.ratio_clipped_vals.append((x != clamped_x).sum().item() / x.numel())
-                return clamped_x
-            return x
+        #     self.n_samples += 1
+        #     if self.n_samples > 1:
+        #         variance = self.m2_per_channel / (self.n_samples - 1)
+        #         self.std_per_channel = torch.sqrt(variance)
+        #         if self.std_threshold is not None:
+        #             self.threshold_low = self.mean_per_channel - self.std_per_channel * self.std_threshold
+        #             self.threshold_high = self.mean_per_channel + self.std_per_channel * self.std_threshold
+        #     return x
+        # else:
+        #     if self.threshold_low is not None and self.threshold_high is not None:
+        #         clamped_x = torch.clamp(x, self.threshold_low, self.threshold_high)
+        #         self.ratio_clipped_vals.append((x != clamped_x).sum().item() / x.numel())
+        #         return clamped_x
+        #     return x
 
 # Modified RecurrentGemmaRMSNorm class with Recorder tracking
 class RecurrentGemmaRMSNorm(nn.Module):
@@ -240,6 +241,8 @@ class RecurrentGemmaSdpaAttention(nn.Module):
         self.attention_output_recorder = Recorder()
         self.final_output_recorder = Recorder()
 
+        print('initialized RecurrentGemmaSdpaAttention')
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -301,7 +304,21 @@ class RecurrentGemmaSdpaAttention(nn.Module):
             dropout_p=self.attention_dropout if self.training else 0.0,
             scale=self.head_dim**-0.5,
         )
+        # attn_output: (N,...,Hq,L,Ev)
 
+        # decide based on the attention_weights which heads to prune
+        Hq = attn_output.shape[-3]
+        mask = [0 for i in range(Hq)]
+        # compute mask here 
+        # attn_output = attn_output * mask.unsqueeze(0).unsqueeze(-1)  # Apply the mask to attn_output
+
+        import pdb; pdb.set_trace()
+        breakpoint()
+
+        entropy_fn = lambda x: -torch.sum(x * torch.log(x + 1e-10), dim=-1)
+        entropy = entropy_fn(attention_weights[0,0,:,:8])  # TOD
+        idxs = [0,1]  # TODO: set this based on the calculated entropy
+        attn_output[..., idxs, :, :] = attn_output[..., idxs, :, :]
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
