@@ -241,8 +241,6 @@ class RecurrentGemmaSdpaAttention(nn.Module):
         self.attention_output_recorder = Recorder()
         self.final_output_recorder = Recorder()
 
-        print('initialized RecurrentGemmaSdpaAttention')
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -270,7 +268,6 @@ class RecurrentGemmaSdpaAttention(nn.Module):
 
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
 
-
         # Partial rotary embedding
         query_rot, query_pass = torch.chunk(query_states, int(1 / self.partial_rotary_factor), dim=-1)
         key_rot, key_pass = torch.chunk(key_states, int(1 / self.partial_rotary_factor), dim=-1)
@@ -294,8 +291,27 @@ class RecurrentGemmaSdpaAttention(nn.Module):
         if attention_mask is not None:
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
-        attention_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
-        
+        # calculate attn_weights
+        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
+
+        # calculate normalized attn_weights
+        scale = self.head_dim**-0.5
+        scale_factor = 1 / math.sqrt(query_states.size(-1))
+        L, S = query_states.size(-2), key_states.size(-2)
+        attn_bias = torch.zeros(1, 1, L, S, dtype=query_states.dtype)
+        # attn_bias = torch.zeros(L, S, dtype=query_states.dtype)
+
+        if causal_mask is not None:
+            if causal_mask.dtype == torch.bool:
+                attn_bias.masked_fill_(causal_mask.logical_not(), float("-inf"))
+            else:
+                attn_bias += causal_mask
+
+        attn_weights *= scale_factor
+        attn_weights += attn_bias
+        softmax_attn_weights = torch.softmax(attn_weights, dim=-1)
+
+        # normal forward pass: attn_output
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states.contiguous(),
             key_states.contiguous(),
@@ -304,23 +320,47 @@ class RecurrentGemmaSdpaAttention(nn.Module):
             dropout_p=self.attention_dropout if self.training else 0.0,
             scale=self.head_dim**-0.5,
         )
-        # attn_output: (N,...,Hq,L,Ev)
+        # attn_output = torch.nn.functional.scaled_dot_product_attention(query_states.contiguous(),key_states.contiguous(),value_states.contiguous(),attn_mask=causal_mask,dropout_p=self.attention_dropout if self.training else 0.0,scale=self.head_dim**-0.5)
 
-        # decide based on the attention_weights which heads to prune
-        Hq = attn_output.shape[-3]
-        mask = [0 for i in range(Hq)]
-        # compute mask here 
-        # attn_output = attn_output * mask.unsqueeze(0).unsqueeze(-1)  # Apply the mask to attn_output
+        def dejavu_intervention(attn_weights, attn_output, k: int, attn_mask=None):
+            # attn_output: (N,...,Hq,L,Ev)
+            # attn_weights: (N,...,Hq,L,L), these are normed (softmax etc.)
+            #
+            # NOTE(s):
+            # prefill with seq_len = 7
+            # attn_outputs: torch.Size([1, 10, 7, 256])
+            ## zero out some of the heads: attn_outputs[0, head_idxs, token_idx, :] = 0  # in prefill
+            # autoregressive generation with seq_len = 1
+            # attn_outputs: torch.Size([1, 10, 1, 256])
+            ## zero out some of the heads: attn_outputs[0, head_idxs, 0, :] = 0  # in autoregressive generation bc L=1
+            Hq = attn_output.shape[-3]
+            inp_len = attn_weights.shape[-2]  # TODO: check
+            out_len = attn_weights.shape[-2]  # TODO: check
+            entropy_fn = lambda x: -torch.sum(x * torch.log(x + 1e-10), dim=-1)
+            entropy = entropy_fn(attn_weights)
+            # get indices of the topk values across the first dimension
+            topk = torch.argsort(entropy.squeeze(0), dim=0)[-k:]
+            drop_idxs = torch.argsort(entropy.squeeze(0), dim=0)[:-k]
+            # topk: (2, seqlen)
+            for token_idx in range(topk.shape[1]):
+                attn_output[..., drop_idxs[:, token_idx], token_idx, :] = 0
+            return attn_output
+
+        do_dejavu = True
+        sparse_attn_output = dejavu_intervention(
+            attn_weights, 
+            attn_output,
+            k=2,
+            attn_mask=causal_mask,
+        )
 
         import pdb; pdb.set_trace()
         breakpoint()
 
-        entropy_fn = lambda x: -torch.sum(x * torch.log(x + 1e-10), dim=-1)
-        entropy = entropy_fn(attention_weights[0,0,:,:8])  # TOD
-        idxs = [0,1]  # TODO: set this based on the calculated entropy
-        attn_output[..., idxs, :, :] = attn_output[..., idxs, :, :]
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        if do_dejavu:
+            attn_output = sparse_attn_output.transpose(1, 2).contiguous()
+        else:
+            attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
         # DZ Record attention output
@@ -330,7 +370,7 @@ class RecurrentGemmaSdpaAttention(nn.Module):
 
         # DZ Record final output after o_proj
         self.final_output_recorder(attn_output)
-        return attn_output, attention_weights
+        return attn_output, attn_weights
 
     def _setup_cache(self, batch_size, device, dtype=None):
         if dtype is None and self.config.torch_dtype is not None:
