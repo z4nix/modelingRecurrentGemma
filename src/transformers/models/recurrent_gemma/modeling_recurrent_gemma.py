@@ -50,7 +50,7 @@ import torch
 import torch.nn as nn
 
 class Recorder(nn.Module):
-    def __init__(self, calibrating=True, std_threshold=None):
+    def __init__(self, calibrating=True, std_threshold=6.0):
         super().__init__()
         self.calibrating = calibrating
         self.std_threshold = std_threshold
@@ -64,40 +64,131 @@ class Recorder(nn.Module):
         self.ratio_clipped_vals = []
         self.threshold_low = None
         self.threshold_high = None
+        print(f"Recorder initialized with calibrating={calibrating}, std_threshold={std_threshold}")
+    
     def forward(self, x):
+        # Skip if tensor is empty
+        if x.numel() == 0:
+            print(f"Recorder received empty tensor with shape {x.shape}")
+            return x
+        
+        print(f"Recorder forward: tensor shape={x.shape}, dtype={x.dtype}, calibrating={self.calibrating}")
+        
+        # Calculate batch statistics with proper dimensionality handling
+        if len(x.shape) == 3:  # B, T, D
+            print(f"  Processing 3D tensor with sequential reduction")
+            batch_min = x.min(dim=0)[0].min(dim=0)[0].detach()
+            batch_max = x.max(dim=0)[0].max(dim=0)[0].detach()
+            batch_mean = x.mean(dim=0).mean(dim=0).detach()
+            # Keep reference to flattened tensor for outlier counting
+            x_flattened = x.reshape(-1, x.size(-1))
+        else:  # B, D or other shapes
+            print(f"  Processing 2D tensor with single reduction")
+            batch_min = x.min(dim=0)[0].detach()
+            batch_max = x.max(dim=0)[0].detach()
+            batch_mean = x.mean(dim=0).detach()
+            # For 2D tensors, just reshape to ensure consistent handling
+            x_flattened = x.reshape(-1, x.size(-1))
+        
+        print(f"  Batch stats - min: {batch_min.mean().item():.4f}, max: {batch_max.mean().item():.4f}, mean: {batch_mean.mean().item():.4f}")
+        
         if self.calibrating:
-            # Check if dimensions have changed or first initialization
-            if self.n_samples == 0 or self.min_per_channel.size(0) != x.size(-1):
-                self.min_per_channel = x.min(dim=0, keepdim=False).values
-                self.max_per_channel = x.max(dim=0, keepdim=False).values
-                self.mean_per_channel = x.mean(dim=0, keepdim=False)
-                self.m2_per_channel = torch.zeros_like(self.mean_per_channel)
-                self.outliers_per_channel = torch.zeros_like(self.mean_per_channel)
+            # Initialize or update statistics
+            if self.n_samples == 0 or self.min_per_channel is None:
+                print(f"  First initialization for channel count: {batch_mean.size(0)}")
+                self.min_per_channel = batch_min
+                self.max_per_channel = batch_max
+                self.mean_per_channel = batch_mean
+                self.m2_per_channel = torch.zeros_like(batch_mean)
+                self.outliers_per_channel = torch.zeros_like(batch_mean)
+                print(f"  Initialized stats with shape {self.mean_per_channel.shape}")
+            elif self.min_per_channel.size(0) != batch_mean.size(0):
+                # Handle dimension mismatch
+                print(f"  Dimension mismatch: stats={self.min_per_channel.size(0)}, input={batch_mean.size(0)}")
+                self.min_per_channel = batch_min
+                self.max_per_channel = batch_max
+                self.mean_per_channel = batch_mean
+                self.m2_per_channel = torch.zeros_like(batch_mean)
+                self.outliers_per_channel = torch.zeros_like(batch_mean)
                 self.n_samples = 0  # Reset counter if dimensions changed
-
+                print(f"  Reinitialized stats with shape {self.mean_per_channel.shape}")
             else:
-                self.min_per_channel = torch.min(x.min(dim=0, keepdim=False).values, self.min_per_channel)
-                self.max_per_channel = torch.max(x.max(dim=0, keepdim=False).values, self.max_per_channel)
-                delta = x.mean(dim=0, keepdim=False) - self.mean_per_channel
-                self.mean_per_channel += delta / (self.n_samples + 1)
-                delta2 = x.mean(dim=0, keepdim=False) - self.mean_per_channel
-                self.m2_per_channel += delta * delta2
-
+                print(f"  Updating stats for sample {self.n_samples+1}")
+                # Update min/max
+                self.min_per_channel = torch.min(batch_min, self.min_per_channel)
+                self.max_per_channel = torch.max(batch_max, self.max_per_channel)
+                
+                # Welford's online algorithm for mean and variance
+                delta = batch_mean - self.mean_per_channel
+                self.mean_per_channel = self.mean_per_channel + delta / (self.n_samples + 1)
+                delta2 = batch_mean - self.mean_per_channel
+                self.m2_per_channel = self.m2_per_channel + delta * delta2
+            
+            # Update sample count
             self.n_samples += 1
+            print(f"  Updated n_samples to {self.n_samples}")
+            
+            # Update std and thresholds after we have at least one sample
             if self.n_samples > 1:
+                # Calculate standard deviation
                 variance = self.m2_per_channel / (self.n_samples - 1)
-                self.std_per_channel = torch.sqrt(variance)
-                if self.std_threshold is not None:
-                    self.threshold_low = self.mean_per_channel - self.std_per_channel * self.std_threshold
-                    self.threshold_high = self.mean_per_channel + self.std_per_channel * self.std_threshold
-            return x
-        else:
+                self.std_per_channel = torch.sqrt(variance + 1e-8)  # Add epsilon for numerical stability
+                
+                # Calculate thresholds
+                self.threshold_low = self.mean_per_channel - self.std_per_channel * self.std_threshold
+                self.threshold_high = self.mean_per_channel + self.std_per_channel * self.std_threshold
+                
+                print(f"  Updated thresholds - low: {self.threshold_low.mean().item():.4f}, high: {self.threshold_high.mean().item():.4f}")
+                
+                # Count outliers in this batch using vectorized operations
+                # Create broadcasted thresholds for comparison
+                if len(x.shape) == 3:  # B, T, D
+                    low = self.threshold_low.view(1, 1, -1)
+                    high = self.threshold_high.view(1, 1, -1)
+                else:  # B, D
+                    low = self.threshold_low.view(1, -1)
+                    high = self.threshold_high.view(1, -1)
+                
+                # Count outliers (vectorized version)
+                is_outlier = (x < low) | (x > high)
+                # Sum across all dimensions except the last (channel dimension)
+                outlier_count = is_outlier.sum(dim=tuple(range(len(is_outlier.shape)-1))).float()
+                self.outliers_per_channel = self.outliers_per_channel + outlier_count
+                
+                outlier_percent = 100 * outlier_count.sum().item() / x.numel()
+                print(f"  Detected {outlier_percent:.2f}% outliers in current batch")
+        
+        else:  # Non-calibration mode (applying thresholds)
             if self.threshold_low is not None and self.threshold_high is not None:
-                clamped_x = torch.clamp(x, self.threshold_low, self.threshold_high)
-                self.ratio_clipped_vals.append((x != clamped_x).sum().item() / x.numel())
+                print(f"  Applying thresholds in non-calibration mode")
+                
+                # Create broadcasted thresholds for clamping
+                if len(x.shape) == 3:  # B, T, D
+                    low = self.threshold_low.view(1, 1, -1)
+                    high = self.threshold_high.view(1, 1, -1)
+                else:  # B, D
+                    low = self.threshold_low.view(1, -1)
+                    high = self.threshold_high.view(1, -1)
+                
+                # Apply clamping
+                clamped_x = torch.clamp(x, low, high)
+                
+                # Track global clipping ratio
+                clipped_ratio = (x != clamped_x).sum().item() / x.numel()
+                self.ratio_clipped_vals.append(clipped_ratio)
+                
+                # Count outliers in non-calibration mode too
+                is_outlier = (x < low) | (x > high)
+                outlier_count = is_outlier.sum(dim=tuple(range(len(is_outlier.shape)-1))).float()
+                self.outliers_per_channel = self.outliers_per_channel + outlier_count
+                
+                print(f"  Clipped {clipped_ratio:.4f} of values")
                 return clamped_x
-            return x
-
+            else:
+                print(f"  No thresholds available in non-calibration mode")
+        
+        return x
+        
 # Modified RecurrentGemmaRMSNorm class with Recorder tracking
 class RecurrentGemmaRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
