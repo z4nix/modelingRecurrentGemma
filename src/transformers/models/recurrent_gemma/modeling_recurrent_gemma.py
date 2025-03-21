@@ -61,6 +61,7 @@ class Recorder(nn.Module):
         self.m2_per_channel = None
         self.std_per_channel = None
         self.outliers_per_channel = None
+        self.total_values_per_channel = None  # NEW: Track total values seen per channel
         self.ratio_clipped_vals = []
         self.threshold_low = None
         self.threshold_high = None
@@ -77,18 +78,22 @@ class Recorder(nn.Module):
         # Calculate batch statistics with proper dimensionality handling
         if len(x.shape) == 3:  # B, T, D
             print(f"  Processing 3D tensor with sequential reduction")
-            batch_min = x.min(dim=0)[0].min(dim=0)[0].detach()
-            batch_max = x.max(dim=0)[0].max(dim=0)[0].detach()
-            batch_mean = x.mean(dim=0).mean(dim=0).detach()
-            # Keep reference to flattened tensor for outlier counting
+            # FIX: Use reshape for proper mean calculation across all samples
             x_flattened = x.reshape(-1, x.size(-1))
+            batch_min = x_flattened.min(dim=0)[0].detach()
+            batch_max = x_flattened.max(dim=0)[0].detach()
+            batch_mean = x_flattened.mean(dim=0).detach()
+            # Calculate values per channel in this batch
+            values_per_channel = x.size(0) * x.size(1)
         else:  # B, D or other shapes
             print(f"  Processing 2D tensor with single reduction")
             batch_min = x.min(dim=0)[0].detach()
             batch_max = x.max(dim=0)[0].detach()
             batch_mean = x.mean(dim=0).detach()
-            # For 2D tensors, just reshape to ensure consistent handling
+            # For 2D tensors, reshape to ensure consistent handling
             x_flattened = x.reshape(-1, x.size(-1))
+            # Calculate values per channel in this batch
+            values_per_channel = x.size(0)
         
         print(f"  Batch stats - min: {batch_min.mean().item():.4f}, max: {batch_max.mean().item():.4f}, mean: {batch_mean.mean().item():.4f}")
         
@@ -101,6 +106,7 @@ class Recorder(nn.Module):
                 self.mean_per_channel = batch_mean
                 self.m2_per_channel = torch.zeros_like(batch_mean)
                 self.outliers_per_channel = torch.zeros_like(batch_mean)
+                self.total_values_per_channel = torch.full_like(batch_mean, values_per_channel)  # NEW: Initialize total values
                 print(f"  Initialized stats with shape {self.mean_per_channel.shape}")
             elif self.min_per_channel.size(0) != batch_mean.size(0):
                 # Handle dimension mismatch
@@ -110,6 +116,7 @@ class Recorder(nn.Module):
                 self.mean_per_channel = batch_mean
                 self.m2_per_channel = torch.zeros_like(batch_mean)
                 self.outliers_per_channel = torch.zeros_like(batch_mean)
+                self.total_values_per_channel = torch.full_like(batch_mean, values_per_channel)  # NEW: Reset total values
                 self.n_samples = 0  # Reset counter if dimensions changed
                 print(f"  Reinitialized stats with shape {self.mean_per_channel.shape}")
             else:
@@ -123,6 +130,9 @@ class Recorder(nn.Module):
                 self.mean_per_channel = self.mean_per_channel + delta / (self.n_samples + 1)
                 delta2 = batch_mean - self.mean_per_channel
                 self.m2_per_channel = self.m2_per_channel + delta * delta2
+                
+                # NEW: Update total values seen
+                self.total_values_per_channel += values_per_channel
             
             # Update sample count
             self.n_samples += 1
@@ -155,8 +165,17 @@ class Recorder(nn.Module):
                 outlier_count = is_outlier.sum(dim=tuple(range(len(is_outlier.shape)-1))).float()
                 self.outliers_per_channel = self.outliers_per_channel + outlier_count
                 
+                # NEW: Calculate percentage instead of just count
                 outlier_percent = 100 * outlier_count.sum().item() / x.numel()
+                # NEW: Calculate overall percentage across all batches so far
+                total_outlier_percent = 100 * self.outliers_per_channel.sum().item() / self.total_values_per_channel.sum().item()
+                
                 print(f"  Detected {outlier_percent:.2f}% outliers in current batch")
+                print(f"  Overall: {total_outlier_percent:.2f}% outliers across all batches")
+                
+                # NEW: Add method to get top channels with highest outlier percentages
+                if self.n_samples % 10 == 0:  # Print every 10 batches
+                    self._report_worst_channels(5)  # Report top 5 worst channels
         
         else:  # Non-calibration mode (applying thresholds)
             if self.threshold_low is not None and self.threshold_high is not None:
@@ -181,6 +200,7 @@ class Recorder(nn.Module):
                 is_outlier = (x < low) | (x > high)
                 outlier_count = is_outlier.sum(dim=tuple(range(len(is_outlier.shape)-1))).float()
                 self.outliers_per_channel = self.outliers_per_channel + outlier_count
+                self.total_values_per_channel += values_per_channel  # NEW: Update total values in non-calibration mode too
                 
                 print(f"  Clipped {clipped_ratio:.4f} of values")
                 return clamped_x
@@ -188,6 +208,26 @@ class Recorder(nn.Module):
                 print(f"  No thresholds available in non-calibration mode")
         
         return x
+    
+    # NEW: Method to report channels with highest outlier percentages
+    def _report_worst_channels(self, top_n=5):
+        if self.outliers_per_channel is None or self.total_values_per_channel is None:
+            return
+            
+        # Calculate percentage per channel
+        outlier_percentages = 100 * self.outliers_per_channel / self.total_values_per_channel
+        
+        # Get indices of top_n channels with highest percentages
+        _, worst_indices = torch.topk(outlier_percentages, min(top_n, len(outlier_percentages)))
+        
+        print("\n----- Channels with highest outlier percentages -----")
+        for i, idx in enumerate(worst_indices):
+            idx_item = idx.item()
+            percentage = outlier_percentages[idx_item].item()
+            count = self.outliers_per_channel[idx_item].item()
+            total = self.total_values_per_channel[idx_item].item()
+            print(f"  #{i+1}: Channel {idx_item}: {percentage:.2f}% ({count}/{total} values)")
+        print("----------------------------------------------------\n")
         
 # Modified RecurrentGemmaRMSNorm class with Recorder tracking
 class RecurrentGemmaRMSNorm(nn.Module):
