@@ -73,11 +73,11 @@ class Recorder(nn.Module):
             print(f"Recorder received empty tensor with shape {x.shape}")
             return x
         
-        print(f"Recorder forward: tensor shape={x.shape}, dtype={x.dtype}, calibrating={self.calibrating}")
+        # print(f"Recorder forward: tensor shape={x.shape}, dtype={x.dtype}, calibrating={self.calibrating}")
         
         # Calculate batch statistics with proper dimensionality handling
         if len(x.shape) == 3:  # B, T, D
-            print(f"  Processing 3D tensor with sequential reduction")
+            # print(f"  Processing 3D tensor with sequential reduction")
             # FIX: Use reshape for proper mean calculation across all samples
             x_flattened = x.reshape(-1, x.size(-1))
             batch_min = x_flattened.min(dim=0)[0].detach()
@@ -95,7 +95,7 @@ class Recorder(nn.Module):
             # Calculate values per channel in this batch
             values_per_channel = x.size(0)
         
-        print(f"  Batch stats - min: {batch_min.mean().item():.4f}, max: {batch_max.mean().item():.4f}, mean: {batch_mean.mean().item():.4f}")
+        # print(f"  Batch stats - min: {batch_min.mean().item():.4f}, max: {batch_max.mean().item():.4f}, mean: {batch_mean.mean().item():.4f}")
         
         if self.calibrating:
             # Initialize or update statistics
@@ -110,7 +110,7 @@ class Recorder(nn.Module):
                 print(f"  Initialized stats with shape {self.mean_per_channel.shape}")
             elif self.min_per_channel.size(0) != batch_mean.size(0):
                 # Handle dimension mismatch
-                print(f"  Dimension mismatch: stats={self.min_per_channel.size(0)}, input={batch_mean.size(0)}")
+                # print(f"  Dimension mismatch: stats={self.min_per_channel.size(0)}, input={batch_mean.size(0)}")
                 self.min_per_channel = batch_min
                 self.max_per_channel = batch_max
                 self.mean_per_channel = batch_mean
@@ -118,9 +118,9 @@ class Recorder(nn.Module):
                 self.outliers_per_channel = torch.zeros_like(batch_mean)
                 self.total_values_per_channel = torch.full_like(batch_mean, values_per_channel)  # NEW: Reset total values
                 self.n_samples = 0  # Reset counter if dimensions changed
-                print(f"  Reinitialized stats with shape {self.mean_per_channel.shape}")
+                # print(f"  Reinitialized stats with shape {self.mean_per_channel.shape}")
             else:
-                print(f"  Updating stats for sample {self.n_samples+1}")
+                # print(f"  Updating stats for sample {self.n_samples+1}")
                 # Update min/max
                 self.min_per_channel = torch.min(batch_min, self.min_per_channel)
                 self.max_per_channel = torch.max(batch_max, self.max_per_channel)
@@ -136,7 +136,7 @@ class Recorder(nn.Module):
             
             # Update sample count
             self.n_samples += 1
-            print(f"  Updated n_samples to {self.n_samples}")
+            # print(f"  Updated n_samples to {self.n_samples}")
             
             # Update std and thresholds after we have at least one sample
             if self.n_samples > 1:
@@ -148,7 +148,7 @@ class Recorder(nn.Module):
                 self.threshold_low = self.mean_per_channel - self.std_per_channel * self.std_threshold
                 self.threshold_high = self.mean_per_channel + self.std_per_channel * self.std_threshold
                 
-                print(f"  Updated thresholds - low: {self.threshold_low.mean().item():.4f}, high: {self.threshold_high.mean().item():.4f}")
+                # print(f"  Updated thresholds - low: {self.threshold_low.mean().item():.4f}, high: {self.threshold_high.mean().item():.4f}")
                 
                 # Count outliers in this batch using vectorized operations
                 # Create broadcasted thresholds for comparison
@@ -170,8 +170,8 @@ class Recorder(nn.Module):
                 # NEW: Calculate overall percentage across all batches so far
                 total_outlier_percent = 100 * self.outliers_per_channel.sum().item() / self.total_values_per_channel.sum().item()
                 
-                print(f"  Detected {outlier_percent:.2f}% outliers in current batch")
-                print(f"  Overall: {total_outlier_percent:.2f}% outliers across all batches")
+                # print(f"  Detected {outlier_percent:.2f}% outliers in current batch")
+                # print(f"  Overall: {total_outlier_percent:.2f}% outliers across all batches")
                 
                 # NEW: Add method to get top channels with highest outlier percentages
                 if self.n_samples % 10 == 0:  # Print every 10 batches
